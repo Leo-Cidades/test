@@ -1,0 +1,508 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Mezclador 4 pistas</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      }
+
+      body {
+        margin: 0;
+        padding: 24px;
+        display: grid;
+        gap: 16px;
+        max-width: 920px;
+      }
+
+      .controls,
+      .track {
+        border: 1px solid #6666;
+        border-radius: 12px;
+        padding: 12px;
+      }
+
+      .top-controls {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px;
+        margin-top: 10px;
+      }
+
+      .progress-row {
+        display: grid;
+        grid-template-columns: auto 1fr auto;
+        align-items: center;
+        gap: 10px;
+        margin-top: 10px;
+      }
+
+      .track {
+        display: grid;
+        grid-template-columns: 1fr auto minmax(180px, 280px);
+        align-items: center;
+        gap: 12px;
+      }
+
+      .kbd {
+        opacity: 0.75;
+        font-size: 0.9rem;
+      }
+
+      input[type='range'] {
+        width: 100%;
+      }
+
+      .status,
+      .folder-label {
+        font-size: 0.95rem;
+        opacity: 0.9;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Mezclador de stems (4 pistas)</h1>
+
+    <section class="controls">
+      <p>
+        Selecciona una carpeta principal que contenga subcarpetas. Cada subcarpeta debe tener:
+        <strong>vocals.wav</strong>, <strong>other.wav</strong>, <strong>drums.wav</strong>,
+        <strong>bass.wav</strong>.
+      </p>
+
+      <input id="folderInput" type="file" webkitdirectory directory multiple />
+
+      <div class="top-controls">
+        <button id="prevBtn" type="button" disabled>⏮ Atrás</button>
+        <button id="pauseBtn" type="button" disabled>⏸ Pausar</button>
+        <button id="nextBtn" type="button" disabled>⏭ Adelante</button>
+        <span class="folder-label" id="currentFolder">Subcarpeta actual: —</span>
+      </div>
+
+      <div class="progress-row">
+        <span id="currentTime">00:00</span>
+        <input id="progress" type="range" min="0" max="0" value="0" step="0.01" disabled />
+        <span id="totalTime">00:00</span>
+      </div>
+
+      <p class="status" id="status">Esperando carpeta principal…</p>
+    </section>
+
+    <section id="tracks"></section>
+
+    <script>
+      const REQUIRED_TRACKS = ['vocals.wav', 'other.wav', 'drums.wav', 'bass.wav'];
+      const KEY_TO_TRACK = { '1': 0, '2': 1, '3': 2, '4': 3 };
+
+      const folderInput = document.getElementById('folderInput');
+      const tracksContainer = document.getElementById('tracks');
+      const statusEl = document.getElementById('status');
+      const progressEl = document.getElementById('progress');
+      const currentTimeEl = document.getElementById('currentTime');
+      const totalTimeEl = document.getElementById('totalTime');
+      const prevBtn = document.getElementById('prevBtn');
+      const nextBtn = document.getElementById('nextBtn');
+      const pauseBtn = document.getElementById('pauseBtn');
+      const currentFolderEl = document.getElementById('currentFolder');
+
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      const trackStates = [];
+
+      let isPlaying = false;
+      let duration = 0;
+      let playbackStartTime = 0;
+      let playbackOffset = 0;
+      let rafId = null;
+      let isScrubbing = false;
+
+      let folderFilesMap = new Map();
+      let folderNames = [];
+      let currentFolderIndex = -1;
+
+      function setStatus(text) {
+        statusEl.textContent = text;
+      }
+
+      function formatTime(seconds) {
+        const sec = Math.max(0, Math.floor(seconds));
+        const mm = String(Math.floor(sec / 60)).padStart(2, '0');
+        const ss = String(sec % 60).padStart(2, '0');
+        return `${mm}:${ss}`;
+      }
+
+      function getCurrentPosition() {
+        if (!isPlaying) return playbackOffset;
+        return Math.min(duration, playbackOffset + (audioContext.currentTime - playbackStartTime));
+      }
+
+      function updateProgressUi(position = getCurrentPosition()) {
+        if (!isScrubbing) {
+          progressEl.value = String(Math.min(duration, position));
+        }
+        currentTimeEl.textContent = formatTime(position);
+      }
+
+      function stopProgressLoop() {
+        if (rafId !== null) {
+          cancelAnimationFrame(rafId);
+          rafId = null;
+        }
+      }
+
+      function startProgressLoop() {
+        stopProgressLoop();
+
+        function tick() {
+          const position = getCurrentPosition();
+          updateProgressUi(position);
+
+          if (position >= duration) {
+            isPlaying = false;
+            playbackOffset = duration;
+            pauseBtn.textContent = '▶ Reanudar';
+            stopProgressLoop();
+            return;
+          }
+
+          rafId = requestAnimationFrame(tick);
+        }
+
+        rafId = requestAnimationFrame(tick);
+      }
+
+      function stopAllSources() {
+        trackStates.forEach((track) => {
+          if (track.source) {
+            try {
+              track.source.stop();
+            } catch (_) {
+              // ignora errores si la fuente ya se detuvo
+            }
+            track.source.disconnect();
+            track.source = null;
+          }
+        });
+      }
+
+      function clearPlayback() {
+        stopAllSources();
+        stopProgressLoop();
+
+        trackStates.forEach((track) => {
+          track.buffer = null;
+          track.gainNode?.disconnect();
+          track.gainNode = null;
+        });
+
+        trackStates.length = 0;
+        duration = 0;
+        playbackOffset = 0;
+        isPlaying = false;
+        progressEl.max = '0';
+        progressEl.value = '0';
+        progressEl.disabled = true;
+        currentTimeEl.textContent = '00:00';
+        totalTimeEl.textContent = '00:00';
+        pauseBtn.disabled = true;
+        pauseBtn.textContent = '⏸ Pausar';
+      }
+
+      function renderTracks() {
+        tracksContainer.innerHTML = '';
+
+        trackStates.forEach((track, index) => {
+          const row = document.createElement('div');
+          row.className = 'track';
+
+          const label = document.createElement('div');
+          label.innerHTML = `<strong>${track.name}</strong> <span class="kbd">(tecla ${index + 1})</span>`;
+
+          const muteBtn = document.createElement('button');
+          muteBtn.type = 'button';
+
+          const volume = document.createElement('input');
+          volume.type = 'range';
+          volume.min = '0';
+          volume.max = '1';
+          volume.step = '0.01';
+          volume.value = String(track.volume);
+
+          function updateButton() {
+            muteBtn.textContent = track.muted ? 'Desmutear' : 'Mutear';
+          }
+
+          function updateGain() {
+            if (!track.gainNode) return;
+            const target = track.muted ? 0 : track.volume;
+            track.gainNode.gain.setTargetAtTime(target, audioContext.currentTime, 0.01);
+          }
+
+          muteBtn.addEventListener('click', () => {
+            track.muted = !track.muted;
+            updateButton();
+            updateGain();
+          });
+
+          volume.addEventListener('input', (event) => {
+            track.volume = Number(event.target.value);
+            updateGain();
+          });
+
+          track.toggleMute = () => {
+            track.muted = !track.muted;
+            updateButton();
+            updateGain();
+          };
+
+          updateButton();
+          row.append(label, muteBtn, volume);
+          tracksContainer.appendChild(row);
+        });
+      }
+
+      function startSynchronizedPlayback(offset = 0) {
+        stopAllSources();
+
+        playbackOffset = Math.min(Math.max(offset, 0), duration);
+        playbackStartTime = audioContext.currentTime;
+
+        trackStates.forEach((track) => {
+          const source = audioContext.createBufferSource();
+          source.buffer = track.buffer;
+          source.connect(track.gainNode);
+          source.start(playbackStartTime, playbackOffset);
+          track.source = source;
+        });
+
+        isPlaying = true;
+        pauseBtn.textContent = '⏸ Pausar';
+        updateProgressUi(playbackOffset);
+        startProgressLoop();
+      }
+
+      function pausePlayback() {
+        if (!isPlaying) return;
+        playbackOffset = getCurrentPosition();
+        stopAllSources();
+        stopProgressLoop();
+        isPlaying = false;
+        updateProgressUi(playbackOffset);
+        pauseBtn.textContent = '▶ Reanudar';
+      }
+
+      function resumePlayback() {
+        if (isPlaying || trackStates.length === 0) return;
+        startSynchronizedPlayback(playbackOffset);
+      }
+
+      function seekTo(seconds) {
+        const newPosition = Math.min(Math.max(seconds, 0), duration);
+
+        if (isPlaying) {
+          startSynchronizedPlayback(newPosition);
+        } else {
+          playbackOffset = newPosition;
+          updateProgressUi(newPosition);
+        }
+      }
+
+      function updateFolderControls() {
+        const hasFolders = folderNames.length > 0;
+        prevBtn.disabled = !hasFolders || currentFolderIndex <= 0;
+        nextBtn.disabled = !hasFolders || currentFolderIndex >= folderNames.length - 1;
+
+        if (!hasFolders || currentFolderIndex < 0) {
+          currentFolderEl.textContent = 'Subcarpeta actual: —';
+          return;
+        }
+
+        currentFolderEl.textContent = `Subcarpeta actual: ${folderNames[currentFolderIndex]}`;
+      }
+
+      function getSubfolderPath(file) {
+        const relative = file.webkitRelativePath || file.name;
+        const parts = relative.split('/').filter(Boolean);
+
+        // Esperado: carpetaPrincipal/subcarpeta/(opcional...)/archivo
+        if (parts.length < 3) return null;
+        return parts.slice(1, -1).join('/');
+      }
+
+      function buildFolderMap(files) {
+        const map = new Map();
+
+        for (const file of files) {
+          const subfolder = getSubfolderPath(file);
+          if (!subfolder) continue;
+
+          if (!map.has(subfolder)) {
+            map.set(subfolder, []);
+          }
+
+          map.get(subfolder).push(file);
+        }
+
+        return map;
+      }
+
+      async function decodeFileToBuffer(file) {
+        const arrayBuffer = await file.arrayBuffer();
+        return audioContext.decodeAudioData(arrayBuffer);
+      }
+
+      async function loadStemFolder(files) {
+        clearPlayback();
+
+        const normalized = new Map();
+        for (const file of files) {
+          normalized.set(file.name.toLowerCase(), file);
+        }
+
+        const missing = REQUIRED_TRACKS.filter((name) => !normalized.has(name));
+        if (missing.length > 0) {
+          throw new Error(`Faltan archivos: ${missing.join(', ')}`);
+        }
+
+        for (const name of REQUIRED_TRACKS) {
+          const file = normalized.get(name);
+          const buffer = await decodeFileToBuffer(file);
+          const gainNode = audioContext.createGain();
+          gainNode.gain.value = 1;
+          gainNode.connect(audioContext.destination);
+
+          trackStates.push({
+            name,
+            buffer,
+            source: null,
+            gainNode,
+            volume: 1,
+            muted: false,
+            toggleMute: null,
+          });
+        }
+
+        duration = Math.max(...trackStates.map((track) => track.buffer.duration));
+        progressEl.max = String(duration);
+        progressEl.value = '0';
+        progressEl.disabled = false;
+        currentTimeEl.textContent = formatTime(0);
+        totalTimeEl.textContent = formatTime(duration);
+        pauseBtn.disabled = false;
+
+        renderTracks();
+        startSynchronizedPlayback(0);
+      }
+
+      async function loadCurrentSubfolder() {
+        if (currentFolderIndex < 0 || currentFolderIndex >= folderNames.length) {
+          return;
+        }
+
+        const folderName = folderNames[currentFolderIndex];
+        const folderFiles = folderFilesMap.get(folderName) || [];
+
+        updateFolderControls();
+        setStatus(`Cargando subcarpeta "${folderName}"…`);
+
+        await loadStemFolder(folderFiles);
+        setStatus(`Reproduciendo "${folderName}". Usa click, barra de progreso, o teclas 1-4.`);
+      }
+
+      folderInput.addEventListener('change', async () => {
+        const files = Array.from(folderInput.files || []);
+        if (files.length === 0) return;
+
+        setStatus('Leyendo carpeta principal…');
+
+        try {
+          if (audioContext.state === 'suspended') {
+            await audioContext.resume();
+          }
+
+          folderFilesMap = buildFolderMap(files);
+          folderNames = Array.from(folderFilesMap.keys()).sort((a, b) => a.localeCompare(b));
+
+          if (folderNames.length === 0) {
+            throw new Error('No encontré subcarpetas válidas dentro de la carpeta principal.');
+          }
+
+          currentFolderIndex = 0;
+          await loadCurrentSubfolder();
+        } catch (error) {
+          clearPlayback();
+          folderFilesMap = new Map();
+          folderNames = [];
+          currentFolderIndex = -1;
+          updateFolderControls();
+          setStatus(`Error: ${error.message}`);
+        }
+      });
+
+      prevBtn.addEventListener('click', async () => {
+        if (currentFolderIndex <= 0) return;
+
+        currentFolderIndex -= 1;
+        try {
+          await loadCurrentSubfolder();
+        } catch (error) {
+          setStatus(`Error: ${error.message}`);
+        }
+      });
+
+      nextBtn.addEventListener('click', async () => {
+        if (currentFolderIndex >= folderNames.length - 1) return;
+
+        currentFolderIndex += 1;
+        try {
+          await loadCurrentSubfolder();
+        } catch (error) {
+          setStatus(`Error: ${error.message}`);
+        }
+      });
+
+      pauseBtn.addEventListener('click', () => {
+        if (isPlaying) {
+          pausePlayback();
+        } else {
+          resumePlayback();
+        }
+      });
+
+      progressEl.addEventListener('pointerdown', () => {
+        isScrubbing = true;
+      });
+
+      progressEl.addEventListener('pointerup', () => {
+        isScrubbing = false;
+        seekTo(Number(progressEl.value));
+      });
+
+      progressEl.addEventListener('input', (event) => {
+        const previewPosition = Number(event.target.value);
+        currentTimeEl.textContent = formatTime(previewPosition);
+      });
+
+      progressEl.addEventListener('change', (event) => {
+        isScrubbing = false;
+        seekTo(Number(event.target.value));
+      });
+
+      document.addEventListener('keydown', (event) => {
+        const trackIndex = KEY_TO_TRACK[event.key];
+        if (trackIndex === undefined) return;
+
+        const track = trackStates[trackIndex];
+        if (!track || !track.toggleMute) return;
+
+        event.preventDefault();
+        track.toggleMute();
+      });
+
+      updateFolderControls();
+    </script>
+  </body>
+</html>
